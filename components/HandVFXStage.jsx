@@ -40,6 +40,9 @@ export default function HandVFXStage() {
   const lastTimeRef = useRef(performance.now());
   const fpsCounterRef = useRef({ frames: 0, lastUpdate: performance.now() });
   const isDetectingRef = useRef(false);
+  const lastDetectionTimeRef = useRef(0);
+  const lastHudUpdateRef = useRef(0);
+  const lastStrokeCountRef = useRef(0);
   const lastLandmarksRef = useRef([]);
   const lastHandednessRef = useRef([]);
 
@@ -81,7 +84,7 @@ export default function HandVFXStage() {
     );
   }, []);
 
-  // Setup and Start Camera Stream
+  // Setup and Start Camera Stream (Optimized for Mobile)
   const startCamera = useCallback(async () => {
     setCameraError(null);
     try {
@@ -89,12 +92,14 @@ export default function HandVFXStage() {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       }
 
+      const isMobileDevice = typeof navigator !== "undefined" && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (typeof window !== "undefined" && window.innerWidth < 768));
+
       const constraints = {
         video: {
           facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 60, min: 30 },
+          width: { ideal: isMobileDevice ? 640 : 1280 },
+          height: { ideal: isMobileDevice ? 480 : 720 },
+          frameRate: { ideal: isMobileDevice ? 30 : 60, min: 20 },
         },
         audio: false,
       };
@@ -147,9 +152,10 @@ export default function HandVFXStage() {
   const handleClearCanvas = useCallback(() => {
     trailRef.current.clear();
     setStrokeCount(0);
+    lastStrokeCountRef.current = 0;
   }, []);
 
-  // Resize canvas to fill container
+  // Resize canvas to fill container (with mobile DPR cap)
   const handleResize = useCallback(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -157,10 +163,13 @@ export default function HandVFXStage() {
 
     const width = container.clientWidth;
     const height = container.clientHeight;
-    const dpr = window.devicePixelRatio || 1;
+    const isMobileDevice = typeof navigator !== "undefined" && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768);
+    // Modern phones have DPR of 3.0-4.0 which creates 20+ megapixel canvases. Cap to 1.0 on mobile and 1.5 on desktop.
+    const maxDpr = isMobileDevice ? 1.0 : 1.5;
+    const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
 
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
 
@@ -236,8 +245,12 @@ export default function HandVFXStage() {
       const width = containerRef.current?.clientWidth || window.innerWidth;
       const height = containerRef.current?.clientHeight || window.innerHeight;
 
-      // Asynchronous non-blocking hand detection
-      if (cameraActive && video.readyState >= 2 && !isDetectingRef.current) {
+      // Asynchronous throttled hand detection (target 30 FPS detection on mobile to leave CPU for rendering)
+      const isMobileDevice = typeof navigator !== "undefined" && (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || width < 768);
+      const minDetectionInterval = isMobileDevice ? 33 : 16;
+
+      if (cameraActive && video.readyState >= 2 && !isDetectingRef.current && (timestamp - lastDetectionTimeRef.current >= minDetectionInterval)) {
+        lastDetectionTimeRef.current = timestamp;
         isDetectingRef.current = true;
         try {
           const result = detectHands(video, timestamp);
@@ -300,7 +313,12 @@ export default function HandVFXStage() {
       }
 
       setMode((prev) => (prev !== nextMode ? nextMode : prev));
-      setTrackedHandsData(classifiedHands);
+
+      // Throttle React HUD state update to ~5 times/sec (every 180ms) instead of 60 times/sec to prevent mobile freeze
+      if (timestamp - lastHudUpdateRef.current >= 180) {
+        lastHudUpdateRef.current = timestamp;
+        setTrackedHandsData(classifiedHands);
+      }
 
       // CLEAR CANVAS FOR CURRENT FRAME
       ctx.clearRect(0, 0, width, height);
@@ -332,7 +350,12 @@ export default function HandVFXStage() {
       }
 
       trailEngine.draw(ctx, cursorPoint, activePalette.hex, nextMode === "drawing", dt);
-      setStrokeCount(trailEngine.strokes.length);
+
+      // Only update strokeCount React state when count actually changes
+      if (trailEngine.strokes.length !== lastStrokeCountRef.current) {
+        lastStrokeCountRef.current = trailEngine.strokes.length;
+        setStrokeCount(trailEngine.strokes.length);
+      }
 
       // Request next frame
       animFrameIdRef.current = requestAnimationFrame(renderLoop);
